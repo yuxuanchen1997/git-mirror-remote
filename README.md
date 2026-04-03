@@ -68,6 +68,9 @@ tailscale up --authkey="${TS_AUTHKEY}" --hostname=gitcache
 # Expose the HTTP port via Tailscale serve (HTTPS on your tailnet)
 tailscale serve --bg 8080
 
+# Expose the SSH port via Tailscale serve (TCP forwarding)
+tailscale serve --bg --tcp 2222 tcp://localhost:2222
+
 # Start the cache proxy
 exec git-cache-proxy \
   --ssh-port 2222 \
@@ -92,7 +95,9 @@ podman run -d \
   git-cache-proxy
 ```
 
-The proxy is now accessible at `https://gitcache.<your-tailnet>.ts.net` for any machine on your tailnet.
+The proxy is now accessible to any machine on your tailnet:
+- **HTTP**: `https://gitcache.<your-tailnet>.ts.net` (TLS terminated by Tailscale)
+- **SSH**: `gitcache.<your-tailnet>.ts.net:2222` (TCP forwarded by Tailscale)
 
 ### CLI Options
 
@@ -147,6 +152,13 @@ git config --global url."https://gitcache.<your-tailnet>.ts.net/github.com/".ins
 git config --global url."ssh://localhost:2222/github.com/".insteadOf "git@github.com:"
 ```
 
+#### SSH proxy via Tailscale
+
+```bash
+# Rewrite github.com SSH URLs to go through the Tailscale-exposed SSH proxy
+git config --global url."ssh://gitcache.<your-tailnet>.ts.net:2222/github.com/".insteadOf "git@github.com:"
+```
+
 After setting up rewrite rules, all git operations transparently go through the cache:
 
 ```bash
@@ -161,8 +173,16 @@ cd llvm-project && git fetch                      # also proxied
 If you prefer SSH config over URL rewrite rules, add to `~/.ssh/config`:
 
 ```
+# Local proxy
 Host gitcache
     HostName localhost
+    Port 2222
+    User git
+    IdentityFile ~/.ssh/id_ed25519
+
+# Via Tailscale
+Host gitcache-ts
+    HostName gitcache.<your-tailnet>.ts.net
     Port 2222
     User git
     IdentityFile ~/.ssh/id_ed25519
@@ -172,6 +192,7 @@ Then clone with:
 
 ```bash
 git clone git@gitcache:github.com/llvm/llvm-project.git
+git clone git@gitcache-ts:github.com/llvm/llvm-project.git  # via tailnet
 ```
 
 ### Adding multiple hosts
