@@ -1,8 +1,8 @@
-mod cache;
-mod config;
-mod git_backend;
-mod http_server;
-mod ssh_server;
+pub mod cache;
+pub mod config;
+pub mod git_backend;
+pub mod http_server;
+pub mod ssh_server;
 
 use clap::Parser;
 use std::sync::Arc;

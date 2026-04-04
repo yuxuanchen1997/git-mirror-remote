@@ -5,6 +5,26 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use http::StatusCode;
 
+/// Find git-http-backend in PATH or common locations.
+fn find_git_http_backend() -> &'static str {
+    // First, try PATH
+    if let Ok(path) = std::process::Command::new("which")
+        .arg("git-http-backend")
+        .output()
+    {
+        if path.status.success() {
+            let path_str = std::str::from_utf8(&path.stdout).unwrap_or("").trim();
+            if !path_str.is_empty() {
+                // Leak the string to return a &'static str
+                return Box::leak(path_str.to_string().into_boxed_str());
+            }
+        }
+    }
+
+    // Fall back to common locations
+    "/usr/lib/git-core/git-http-backend"
+}
+
 /// Serve a git HTTP request via git-http-backend (CGI).
 pub async fn serve_via_cgi(
     cache_root: &Path,
@@ -14,7 +34,8 @@ pub async fn serve_via_cgi(
     content_type: Option<&str>,
     body: Bytes,
 ) -> Result<(StatusCode, Vec<(String, String)>, Vec<u8>)> {
-    let mut cmd = tokio::process::Command::new("/usr/lib/git-core/git-http-backend");
+    let git_http_backend = find_git_http_backend();
+    let mut cmd = tokio::process::Command::new(git_http_backend);
 
     cmd.env("GIT_PROJECT_ROOT", cache_root)
         .env("GIT_HTTP_EXPORT_ALL", "1")
