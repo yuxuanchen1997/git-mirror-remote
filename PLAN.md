@@ -35,8 +35,8 @@ cd /another/dir && git fetch
 
 1. **Request parsing**: Extract the upstream repo URL from the request path. For HTTP: `GET /github.com/llvm/llvm-project.git/info/refs?service=git-upload-pack` → upstream is `https://github.com/llvm/llvm-project.git`. For SSH: exec command `git-upload-pack 'github.com/llvm/llvm-project.git'` → same upstream
 2. **Cache lookup**: Check if `<cache-dir>/github.com/llvm/llvm-project.git` exists as a bare repo
-3. **Cache miss**: Run `git clone --bare <upstream-url> <cache-path>`, then serve the request from the cache
-4. **Cache hit**: Serve from cache immediately. If the cache is older than a configurable staleness threshold (default: 5 minutes), trigger a background `git fetch --prune origin` on the cached bare repo
+3. **Cache miss**: Clone from upstream using `gix` (gitoxide) — the Rust-native git implementation. Serve the request from the new cache
+4. **Cache hit**: Serve from cache immediately. If the cache is older than a configurable staleness threshold (default: 5 minutes), synchronously refresh via `gix` fetch before serving, so clients always get up-to-date refs
 5. **Serving**: For HTTP, shell out to `git http-backend` (CGI). For SSH, spawn `git-upload-pack` directly. Let git handle pack-file generation in both cases
 
 ### Components to build
@@ -46,10 +46,12 @@ cd /another/dir && git fetch
 2. **`config.rs`** — Configuration struct parsed from CLI args. Port numbers, cache directory path, staleness threshold, SSH auth mode, upstream credential settings
 
 3. **`cache.rs`** — Cache manager shared between both servers:
-   - `get_or_create(repo_path: &str) -> Result<PathBuf>` — returns path to cached bare repo, cloning from upstream on cache miss
-   - `maybe_refresh(repo_path: &str)` — checks last-fetched timestamp, triggers background `git fetch --prune origin` if stale
+   - `get_or_create(repo_path: &str) -> Result<PathBuf>` — returns path to cached bare repo, cloning from upstream on cache miss via `gix::prepare_clone_bare()`
+   - `maybe_refresh(repo_path: &str)` — checks last-fetched timestamp, synchronously fetches from upstream via `gix` if stale (so clients always get fresh refs)
    - Per-repo locking via `DashMap<String, Arc<Mutex<()>>>` to serialize concurrent cache-miss clones for the same repo
-   - Last-fetched timestamps stored as a file (`FETCH_HEAD` mtime or a custom `.last-fetched` marker) in each cached bare repo
+   - Separate per-repo refresh locks so concurrent fetch requests share a single upstream fetch
+   - Last-fetched timestamps stored as a `.last-fetched` marker file in each cached bare repo
+   - All `gix` operations wrapped in `tokio::task::spawn_blocking` (gix HTTP/SSH transport is blocking-only)
 
 4. **`http_server.rs`** — Hyper or axum HTTP server. Routes:
    - `GET /<repo-path>/info/refs?service=git-upload-pack` → cache lookup, then delegate to `git http-backend`
@@ -93,7 +95,7 @@ git clone git@gitcache:github.com/llvm/llvm-project.git
 ### Concurrency considerations
 
 - **Multiple clients cloning the same uncached repo simultaneously**: Per-repo lock so only one triggers the upstream clone, others wait on the lock then serve from the now-populated cache
-- **Background fetches**: Spawn a tokio task, don't block the serving path. Use a last-fetched timestamp per repo to avoid redundant fetches. If a background fetch is already in progress for a repo, don't start another
+- **Synchronous fetches**: When cache is stale, refresh synchronously before serving so clients always get fresh refs. Per-repo mutex ensures concurrent requests share a single fetch rather than triggering redundant upstream calls
 - **Serving while fetching**: `git-upload-pack` / `git http-backend` read from the bare repo. Concurrent `git fetch` updates refs atomically, so this is safe
 
 ### Testing
@@ -103,6 +105,40 @@ git clone git@gitcache:github.com/llvm/llvm-project.git
 - **Integration test — staleness**: Clone a repo, wait past the staleness threshold, run `git fetch`, verify a background upstream fetch is triggered
 - **Unit test — path parsing**: Verify correct extraction of upstream URLs from HTTP request paths and SSH exec commands
 - **Unit test — cache manager**: Test lock behavior, timestamp checking, concurrent access patterns
+
+### Eliminating git binary dependencies — roadmap
+
+The project uses `gix` (gitoxide) for upstream operations (clone, fetch) but still requires system git binaries for serving clients. Here's the status and plan:
+
+#### Current state
+
+| Operation | Implementation | Binary dependency |
+|-----------|---------------|-------------------|
+| Upstream clone | `gix::prepare_clone_bare()` | None (pure Rust) |
+| Upstream fetch | `gix::Repository::find_remote().connect().fetch()` | None (pure Rust) |
+| Repo config | Direct file write | None |
+| HTTP ref advertisement | `git http-backend` (CGI) | `git-http-backend` |
+| HTTP pack serving | `git http-backend` (CGI) | `git-http-backend` |
+| SSH pack serving | `git-upload-pack` subprocess | `git-upload-pack` |
+
+#### Phase 2 — Replace ref advertisement (feasible now)
+
+Replace `GET /repo/info/refs?service=git-upload-pack` with a pure-Rust implementation:
+- Open bare repo with `gix::open()`
+- Iterate refs with `repo.references()`
+- Format response as git smart HTTP ref advertisement using pkt-line encoding (`gix-packetline` crate)
+- Eliminates `git-http-backend` for the discovery/info-refs endpoint only
+
+Estimated scope: ~200-300 lines in a new function in `git_backend.rs`.
+
+#### Phase 3 — Replace pack serving (NOT feasible today)
+
+Would replace both `git-http-backend` (POST) and `git-upload-pack` (SSH) with a pure-Rust implementation:
+- Parse client's "want" and "have" lines from the pack protocol
+- Perform negotiation to determine the minimal set of objects
+- Generate and stream a packfile using `gix-pack`
+
+**Blocker**: gitoxide has no server-side pack protocol implementation. Building one means reimplementing `git-upload-pack` from scratch using `gix-protocol` (client-oriented), `gix-pack` (pack generation), and `gix-revwalk` (object traversal). This is 1000+ lines and significant effort. Recommend waiting for upstream gitoxide to add server-side support, or keeping system `git-upload-pack` / `git-http-backend` indefinitely.
 
 ### Stretch goals (don't build initially)
 
