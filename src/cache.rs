@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use tokio::sync::Mutex;
-use tracing;
 
 use crate::config::{Config, UpstreamProto};
 
@@ -32,8 +32,25 @@ impl CacheManager {
 
     /// Construct the upstream URL for a repo path like `github.com/user/repo.git`.
     pub fn upstream_url(&self, repo_path: &str) -> String {
-        // repo_path is e.g. "github.com/user/repo.git"
-        // Split into host and the rest
+        let (host, path) = match repo_path.find('/') {
+            Some(idx) => (&repo_path[..idx], &repo_path[idx + 1..]),
+            None => (repo_path, ""),
+        };
+
+        match self.config.upstream_proto {
+            UpstreamProto::Ssh => format!("git@{host}:{path}"),
+            UpstreamProto::Https => {
+                if let Some(ref token) = self.config.upstream_https_token {
+                    format!("https://oauth2:{token}@{host}/{path}")
+                } else {
+                    format!("https://{host}/{path}")
+                }
+            }
+        }
+    }
+
+    /// Construct a "clean" upstream URL without embedded credentials (for display/storage).
+    fn clean_upstream_url(&self, repo_path: &str) -> String {
         let (host, path) = match repo_path.find('/') {
             Some(idx) => (&repo_path[..idx], &repo_path[idx + 1..]),
             None => (repo_path, ""),
@@ -74,39 +91,25 @@ impl CacheManager {
         }
 
         let upstream = self.upstream_url(repo_path);
-        tracing::info!("Cache miss: cloning {upstream} -> {}", cache_path.display());
+        let clean_url = self.clean_upstream_url(repo_path);
+        tracing::info!("Cache miss: cloning {clean_url} -> {}", cache_path.display());
 
         // Ensure parent directory exists
         if let Some(parent) = cache_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut cmd = tokio::process::Command::new("git");
-        cmd.args(["clone", "--bare", &upstream])
-            .arg(&cache_path);
-
-        self.apply_upstream_env(&mut cmd);
-
-        let output = cmd
-            .output()
+        let config = self.config.clone();
+        let cp = cache_path.clone();
+        let cu = clean_url.clone();
+        let result = tokio::task::spawn_blocking(move || gix_clone_bare(&upstream, &cu, &cp, &config))
             .await
-            .context("Failed to spawn git clone")?;
+            .context("spawn_blocking join error")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("git clone failed: {stderr}");
+        if let Err(ref e) = result {
+            tracing::error!("gix clone failed: {e:#}");
         }
-
-        // Enable http.uploadpack for HTTP serving
-        let config_output = tokio::process::Command::new("git")
-            .args(["config", "http.uploadpack", "true"])
-            .current_dir(&cache_path)
-            .output()
-            .await?;
-
-        if !config_output.status.success() {
-            tracing::warn!("Failed to set http.uploadpack on cached repo");
-        }
+        result?;
 
         // Touch .last-fetched marker
         self.touch_last_fetched(&cache_path)?;
@@ -128,7 +131,7 @@ impl CacheManager {
                     .unwrap_or(Duration::MAX);
                 age > Duration::from_secs(self.config.staleness)
             }
-            Err(_) => true, // No marker = stale
+            Err(_) => true,
         };
 
         if !is_stale {
@@ -144,7 +147,7 @@ impl CacheManager {
 
         let _guard = lock.lock().await;
 
-        // Re-check staleness after acquiring lock — another request may have refreshed
+        // Re-check staleness after acquiring lock
         let still_stale = match marker.metadata().and_then(|m| m.modified()) {
             Ok(mtime) => {
                 let age = SystemTime::now()
@@ -159,59 +162,119 @@ impl CacheManager {
             return;
         }
 
-        tracing::info!("Refreshing cache: {repo_path}");
+        let rp = repo_path.to_string();
+        tracing::info!("Refreshing cache: {rp}");
 
-        let mut cmd = tokio::process::Command::new("git");
-        cmd.args(["fetch", "--prune", "origin"])
-            .current_dir(&cache_path);
+        let config = self.config.clone();
+        let cp = cache_path.clone();
 
-        self.apply_upstream_env(&mut cmd);
-
-        match cmd.output().await {
-            Ok(output) if output.status.success() => {
+        match tokio::task::spawn_blocking(move || gix_fetch(&cp, &config)).await {
+            Ok(Ok(())) => {
                 let _ = self.touch_last_fetched(&cache_path);
-                tracing::info!("Refresh complete: {repo_path}");
+                tracing::info!("Refresh complete: {rp}");
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!("Refresh failed for {repo_path}: {stderr}");
+            Ok(Err(e)) => {
+                tracing::warn!("Refresh failed for {rp}: {e:#}");
             }
             Err(e) => {
-                tracing::warn!("Refresh error for {repo_path}: {e}");
+                tracing::warn!("Refresh task panicked for {rp}: {e}");
             }
         }
     }
 
-    /// Apply upstream authentication env vars to a git command.
-    fn apply_upstream_env(&self, cmd: &mut tokio::process::Command) {
-        if let Some(ref key_path) = self.config.upstream_ssh_key {
-            cmd.env(
-                "GIT_SSH_COMMAND",
-                format!(
-                    "ssh -i {} -o StrictHostKeyChecking=no",
-                    key_path.display()
-                ),
-            );
-        }
-
-        if let Some(ref token) = self.config.upstream_https_token {
-            // Use a credential helper that returns the token
-            cmd.env("GIT_ASKPASS", "/bin/echo");
-            cmd.env("GIT_TERMINAL_PROMPT", "0");
-            cmd.args([
-                "-c",
-                &format!(
-                    "credential.helper=!f() {{ echo password={token}; }}; f"
-                ),
-            ]);
-        }
-    }
-
-    fn touch_last_fetched(&self, cache_path: &PathBuf) -> Result<()> {
+    fn touch_last_fetched(&self, cache_path: &Path) -> Result<()> {
         let marker = cache_path.join(".last-fetched");
         std::fs::write(&marker, "")?;
         Ok(())
     }
+}
+
+/// Clone an upstream repo as a bare repo using gix.
+/// After cloning, strips credentials from stored remote URL and enables http.uploadpack.
+fn gix_clone_bare(
+    upstream_url: &str,
+    clean_url: &str,
+    cache_path: &Path,
+    config: &Config,
+) -> Result<()> {
+    let mut prep = gix::prepare_clone_bare(upstream_url, cache_path)
+        .context("Failed to prepare bare clone")?;
+
+    // Configure SSH key if provided
+    let mut overrides: Vec<String> = Vec::new();
+    if let Some(ref key_path) = config.upstream_ssh_key {
+        overrides.push(format!(
+            "core.sshCommand=ssh -i {} -o StrictHostKeyChecking=no",
+            key_path.display()
+        ));
+    }
+    if !overrides.is_empty() {
+        prep = prep.with_in_memory_config_overrides(overrides);
+    }
+
+    let (_repo, _outcome) = prep
+        .fetch_only(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
+        .context("gix bare clone fetch failed")?;
+
+    // Strip credentials from stored remote URL and enable http.uploadpack
+    let config_path = cache_path.join("config");
+    let contents = std::fs::read_to_string(&config_path)
+        .context("Failed to read repo config")?;
+
+    // Replace the URL that may contain embedded credentials with the clean one
+    let updated = contents.replace(upstream_url, clean_url);
+    std::fs::write(&config_path, &updated)?;
+
+    // Append http.uploadpack = true
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&config_path)?;
+    writeln!(f, "\n[http]\n\tuploadpack = true")?;
+
+    Ok(())
+}
+
+/// Fetch from origin using gix.
+fn gix_fetch(cache_path: &Path, config: &Config) -> Result<()> {
+    let mut opts = gix::open::Options::default();
+
+    let mut overrides: Vec<String> = Vec::new();
+    if let Some(ref key_path) = config.upstream_ssh_key {
+        overrides.push(format!(
+            "core.sshCommand=ssh -i {} -o StrictHostKeyChecking=no",
+            key_path.display()
+        ));
+    }
+    // For HTTPS token auth on fetch: we need to set the URL with credentials temporarily.
+    // gix will use the remote URL from config (which has no credentials), so we need to
+    // override the credential helper or use the URL directly.
+    if let Some(ref token) = config.upstream_https_token {
+        overrides.push(format!(
+            "credential.helper=!f() {{ echo password={token}; }}; f"
+        ));
+        overrides.push("credential.username=oauth2".to_string());
+    }
+    if !overrides.is_empty() {
+        opts = opts.config_overrides(overrides);
+    }
+
+    let repo: gix::Repository = opts
+        .open(cache_path)
+        .context("Failed to open cached repo")?
+        .into();
+    let remote = repo
+        .find_remote("origin")
+        .context("No 'origin' remote found")?;
+
+    let _outcome = remote
+        .connect(gix::remote::Direction::Fetch)
+        .context("Failed to connect to remote")?
+        .prepare_fetch(gix::progress::Discard, Default::default())
+        .context("Failed to prepare fetch")?
+        .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
+        .context("gix fetch failed")?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -247,6 +310,21 @@ mod tests {
         assert_eq!(
             cm.upstream_url("github.com/llvm/llvm-project.git"),
             "https://github.com/llvm/llvm-project.git"
+        );
+    }
+
+    #[test]
+    fn test_upstream_url_https_with_token() {
+        let mut config = test_config(UpstreamProto::Https);
+        config.upstream_https_token = Some("ghp_test123".to_string());
+        let cm = CacheManager::new(config);
+        assert_eq!(
+            cm.upstream_url("github.com/user/repo.git"),
+            "https://oauth2:ghp_test123@github.com/user/repo.git"
+        );
+        assert_eq!(
+            cm.clean_upstream_url("github.com/user/repo.git"),
+            "https://github.com/user/repo.git"
         );
     }
 }

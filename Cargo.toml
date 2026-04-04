@@ -10,6 +10,10 @@ axum = "0.8"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
+gix = { version = "0.70", default-features = false, features = [
+    "blocking-network-client",
+    "blocking-http-transport-reqwest",
+] }
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
