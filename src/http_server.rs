@@ -86,7 +86,7 @@ async fn handle_info_refs(cache: &AppState, repo_path: &str, query_string: &str)
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    cache.maybe_refresh(repo_path);
+    cache.maybe_refresh(repo_path).await;
 
     let cache_root = cache.config().resolved_cache_dir();
     let path_info = format!("/{repo_path}/info/refs");
@@ -120,7 +120,7 @@ async fn handle_upload_pack(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    cache.maybe_refresh(repo_path);
+    cache.maybe_refresh(repo_path).await;
 
     let cache_root = cache.config().resolved_cache_dir();
     let path_info = format!("/{repo_path}/git-upload-pack");

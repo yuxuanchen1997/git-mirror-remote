@@ -13,8 +13,8 @@ pub struct CacheManager {
     config: Config,
     /// Per-repo locks to serialize concurrent cache-miss clones.
     repo_locks: DashMap<String, Arc<Mutex<()>>>,
-    /// Tracks repos with an in-flight background fetch.
-    in_flight_fetches: DashMap<String, ()>,
+    /// Per-repo locks to serialize concurrent refreshes.
+    refresh_locks: DashMap<String, Arc<Mutex<()>>>,
 }
 
 impl CacheManager {
@@ -22,7 +22,7 @@ impl CacheManager {
         Self {
             config,
             repo_locks: DashMap::new(),
-            in_flight_fetches: DashMap::new(),
+            refresh_locks: DashMap::new(),
         }
     }
 
@@ -115,8 +115,9 @@ impl CacheManager {
         Ok(cache_path)
     }
 
-    /// If the cache is stale, trigger a background fetch.
-    pub fn maybe_refresh(self: &Arc<Self>, repo_path: &str) {
+    /// If the cache is stale, refresh synchronously before serving.
+    /// Concurrent callers for the same repo share a single fetch.
+    pub async fn maybe_refresh(&self, repo_path: &str) {
         let cache_path = self.cache_path(repo_path);
         let marker = cache_path.join(".last-fetched");
 
@@ -134,41 +135,51 @@ impl CacheManager {
             return;
         }
 
-        let repo_key = repo_path.to_string();
+        // Acquire per-repo refresh lock so concurrent requests share one fetch
+        let lock = self
+            .refresh_locks
+            .entry(repo_path.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
 
-        // Don't start another fetch if one is already in flight
-        if self.in_flight_fetches.contains_key(&repo_key) {
+        let _guard = lock.lock().await;
+
+        // Re-check staleness after acquiring lock — another request may have refreshed
+        let still_stale = match marker.metadata().and_then(|m| m.modified()) {
+            Ok(mtime) => {
+                let age = SystemTime::now()
+                    .duration_since(mtime)
+                    .unwrap_or(Duration::MAX);
+                age > Duration::from_secs(self.config.staleness)
+            }
+            Err(_) => true,
+        };
+
+        if !still_stale {
             return;
         }
-        self.in_flight_fetches.insert(repo_key.clone(), ());
 
-        let this = Arc::clone(self);
-        let repo_key_clone = repo_key.clone();
-        tokio::spawn(async move {
-            tracing::info!("Background fetch: {repo_key_clone}");
+        tracing::info!("Refreshing cache: {repo_path}");
 
-            let mut cmd = tokio::process::Command::new("git");
-            cmd.args(["fetch", "--prune", "origin"])
-                .current_dir(&cache_path);
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args(["fetch", "--prune", "origin"])
+            .current_dir(&cache_path);
 
-            this.apply_upstream_env(&mut cmd);
+        self.apply_upstream_env(&mut cmd);
 
-            match cmd.output().await {
-                Ok(output) if output.status.success() => {
-                    let _ = this.touch_last_fetched(&cache_path);
-                    tracing::info!("Background fetch complete: {repo_key_clone}");
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::warn!("Background fetch failed for {repo_key_clone}: {stderr}");
-                }
-                Err(e) => {
-                    tracing::warn!("Background fetch error for {repo_key_clone}: {e}");
-                }
+        match cmd.output().await {
+            Ok(output) if output.status.success() => {
+                let _ = self.touch_last_fetched(&cache_path);
+                tracing::info!("Refresh complete: {repo_path}");
             }
-
-            this.in_flight_fetches.remove(&repo_key_clone);
-        });
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!("Refresh failed for {repo_path}: {stderr}");
+            }
+            Err(e) => {
+                tracing::warn!("Refresh error for {repo_path}: {e}");
+            }
+        }
     }
 
     /// Apply upstream authentication env vars to a git command.

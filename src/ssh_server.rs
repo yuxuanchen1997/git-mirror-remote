@@ -167,7 +167,7 @@ impl Handler for SessionHandler {
             }
         };
 
-        self.cache_manager.maybe_refresh(&repo_path);
+        self.cache_manager.maybe_refresh(&repo_path).await;
 
         // Spawn git subprocess
         let mut child = match crate::git_backend::spawn_git_command(&git_cmd, &cache_path) {
