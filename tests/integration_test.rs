@@ -44,6 +44,7 @@ fn assert_valid_clone(clone_dir: &Path) {
 /// Create a test configuration.
 fn test_config(cache_dir: &Path, http_port: u16) -> Config {
     Config {
+        config_file: None,
         ssh_port: find_free_port(),
         http_port,
         cache_dir: cache_dir.to_path_buf(),
@@ -53,6 +54,7 @@ fn test_config(cache_dir: &Path, http_port: u16) -> Config {
         upstream_ssh_key: None,
         upstream_https_token: None,
         upstream_proto: UpstreamProto::Https,
+        sticky_projects: Vec::new(),
     }
 }
 

@@ -63,7 +63,7 @@ impl CacheManager {
     }
 
     /// Returns the local cache path for a repo.
-    fn cache_path(&self, repo_path: &str) -> PathBuf {
+    pub fn cache_path(&self, repo_path: &str) -> PathBuf {
         self.config.resolved_cache_dir().join(repo_path)
     }
 
@@ -180,6 +180,62 @@ impl CacheManager {
                 tracing::warn!("Refresh task panicked for {rp}: {e}");
             }
         }
+    }
+
+    /// Pre-populate cache for sticky projects.
+    /// Always fetches updates for existing sticky repos (bypasses staleness check).
+    pub async fn prepopulate_sticky(&self, sticky_projects: &[String]) -> Result<()> {
+        if sticky_projects.is_empty() {
+            return Ok(());
+        }
+
+        let start = std::time::Instant::now();
+        tracing::info!(
+            "Pre-populating {} sticky project(s)...",
+            sticky_projects.len()
+        );
+
+        for project in sticky_projects {
+            let cache_path = self.cache_path(project);
+
+            if cache_path.join("HEAD").exists() {
+                // Already cached - fetch updates (bypasses staleness check)
+                tracing::info!("Fetching updates for: {}", project);
+                let config = self.config.clone();
+                let cp = cache_path.clone();
+
+                match tokio::task::spawn_blocking(move || gix_fetch(&cp, &config)).await {
+                    Ok(Ok(())) => {
+                        tracing::info!("Updated: {}", project);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("Failed to update {}: {}", project, e);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Fetch task panicked for {}: {}", project, e);
+                    }
+                }
+            } else {
+                // Not cached - clone
+                tracing::info!("Cloning sticky repo: {}", project);
+                match self.get_or_create(project).await {
+                    Ok(_) => {
+                        tracing::info!("Cloned: {}", project);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to clone {}: {}", project, e);
+                    }
+                }
+            }
+        }
+
+        let duration = start.elapsed();
+        tracing::info!(
+            "Sticky repos updated in {:?}",
+            duration
+        );
+
+        Ok(())
     }
 
     fn touch_last_fetched(&self, cache_path: &Path) -> Result<()> {

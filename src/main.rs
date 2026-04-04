@@ -18,11 +18,24 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
+    let config = Config::load_with_file(config)?;
     let cache_dir = config.resolved_cache_dir();
     std::fs::create_dir_all(&cache_dir)?;
     tracing::info!("Cache directory: {}", cache_dir.display());
 
     let cache_manager = Arc::new(CacheManager::new(config.clone()));
+
+    // Start sticky repo updates in background (don't block server startup)
+    if !config.sticky_projects.is_empty() {
+        let cm = cache_manager.clone();
+        let sticky = config.sticky_projects.clone();
+        tokio::spawn(async move {
+            tracing::info!("Background task: updating {} sticky repo(s)", sticky.len());
+            if let Err(e) = cm.prepopulate_sticky(&sticky).await {
+                tracing::error!("Sticky repo update failed: {:#}", e);
+            }
+        });
+    }
 
     let http_handle = {
         let cm = cache_manager.clone();
