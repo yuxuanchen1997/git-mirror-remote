@@ -1,0 +1,22 @@
+services:
+  git-cache-proxy:
+    build:
+      context: .
+      dockerfile: Containerfile
+    container_name: git-cache-proxy
+    ports:
+      - "2222:2222"
+      - "8080:8080"
+    volumes:
+      # Bind mount: cache lives at ./cache on host
+      - ./cache:/var/cache/git-cache
+      # Named volume: uncomment below instead
+      # - git-cache-data:/var/cache/git-cache
+    environment:
+      - UPSTREAM_PROTO=https
+      - UPSTREAM_HTTPS_TOKEN=${UPSTREAM_HTTPS_TOKEN}
+    restart: unless-stopped
+
+# volumes:
+#   git-cache-data:
+#     name: git-cache-data

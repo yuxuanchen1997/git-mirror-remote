@@ -1,0 +1,13 @@
+target
+tests/
+.git/
+.gitignore
+.git/
+docker-compose.yaml
+compose.yaml
+Makefile
+README.md
+PLAN.md
+*.md
+Cargo.lock
+cache/
